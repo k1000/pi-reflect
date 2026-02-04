@@ -4,7 +4,51 @@ A pi extension that captures, stores, searches, and materializes development ref
 
 ## Installation
 
-The extension is installed at user level and works across all projects:
+### Option A — User-level (recommended)
+
+```bash
+# Clone the repo
+mkdir -p ~/.pi/agent/extensions
+cd ~/.pi/agent/extensions
+git clone https://github.com/k1000/pi-reflect.git reflect
+
+# Install deps
+cd reflect
+npm install
+```
+
+Restart pi. The extension appears under **user** in the extensions list.
+
+### Option B — Project-level (local)
+
+```bash
+# From inside your project root
+mkdir -p .pi/extensions
+cd .pi/extensions
+git clone https://github.com/k1000/pi-reflect.git reflect
+cd reflect
+npm install
+```
+
+Restart pi. The extension appears under **project** in the extensions list.
+
+### Option C — Explicit path (settings.json)
+
+Add to `<project>/.pi/settings.json`:
+
+```json
+{
+  "extensions": [
+    ".pi/extensions/reflect"
+  ]
+}
+```
+
+Then restart pi.
+
+---
+
+### Installed Files (user-level)
 
 ```
 ~/.pi/agent/extensions/reflect/
@@ -15,15 +59,6 @@ The extension is installed at user level and works across all projects:
 ├── package.json      # Dependencies (@sinclair/typebox, pi packages)
 └── node_modules/     # Installed dependencies
 ```
-
-### Setup
-
-```bash
-cd ~/.pi/agent/extensions/reflect
-npm install
-```
-
-Restart pi. The extension appears under **user** in the extensions list.
 
 ### Per-Project Data
 
@@ -50,6 +85,22 @@ cp -r <source-project>/.pi/skills/reflect <target-project>/.pi/skills/reflect
 ```
 
 The skill teaches the LLM when and how to use the reflection tools.
+
+---
+
+## Releases & Tags
+
+This repo uses semantic version tags. Example:
+
+```bash
+# Latest release
+git fetch --tags
+
+# Checkout a specific version
+git checkout v0.1.0
+```
+
+GitHub releases are published for each tag (see the Releases page).
 
 ---
 
