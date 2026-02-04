@@ -1,0 +1,11 @@
+{
+  "name": "pi-reflect",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "^0.51.5",
+    "@mariozechner/pi-ai": "^0.51.5",
+    "@mariozechner/pi-tui": "^0.51.5",
+    "@sinclair/typebox": "^0.34.0"
+  }
+}
