@@ -134,6 +134,8 @@ GitHub releases are published for each tag (see the Releases page).
 ```
 1. CAPTURE (automatic or manual)
    Agent works → agent_end hook detects patterns → store.save()
+   Repeated shell/tool workflows → automation candidate reflection → store.save()
+   Completed task + scratchpad distill candidates → durable distilled procedure + store.save()
    Compaction triggers → session_before_compact → extract learnings → store.save()
    Tree navigation → session_tree → branch summary → store.save()
    LLM calls reflect_capture or reflect_materialize → store.save()

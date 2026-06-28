@@ -1,4 +1,7 @@
+import { execFile } from "node:child_process";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
+import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -6,12 +9,31 @@ import { matchesKey, Key, truncateToWidth } from "@mariozechner/pi-tui";
 import { ReflectionStore } from "./store.ts";
 import { analyzeForReflections, extractFromCompaction, reflectionFromBranch } from "./capture.ts";
 import { ReviewQueue } from "./review.ts";
+import {
+	applyPersistedReflectLearningState,
+	createReflectLearningState,
+	runPostTaskLearning,
+	serializeReflectLearningState,
+} from "./learning.ts";
+import { enqueueArchivistPreserve, readArchivistOutbox, shouldPreserveReflection } from "./archivist.ts";
+import { readNudges, writeNudge, type NudgeTarget } from "./nudge.ts";
 import type { ReflectionType, Importance, Source, TargetType, Mode, Confidence, ReflectionEntry } from "./store.ts";
 import type { ReviewAction } from "./review.ts";
 
+const execFileAsync = promisify(execFile);
+
 export default function (pi: ExtensionAPI) {
-	const store = new ReflectionStore(process.cwd());
+	let store = new ReflectionStore(process.cwd());
 	const reviewQueue = new ReviewQueue();
+	let learningState = createReflectLearningState();
+	const persistLearningState = () => pi.appendEntry("pi-reflect-state", serializeReflectLearningState(learningState));
+	function queueArchivistIfNeeded(ctx: ExtensionContext, entry: ReflectionEntry): ReturnType<typeof enqueueArchivistPreserve> | undefined {
+		if (!shouldPreserveReflection(entry)) return undefined;
+		if (entry.archivistOutboxId) return undefined;
+		const item = enqueueArchivistPreserve(ctx.cwd, entry, store.getContent(entry) ?? undefined);
+		store.markArchivistQueued(entry.id, item.id);
+		return item;
+	}
 
 	// ═════════════════════════════════════════════════════════════════
 	// 1. CUSTOM TOOLS — Let the LLM capture and search reflections
@@ -36,7 +58,7 @@ export default function (pi: ExtensionAPI) {
 			evidence: Type.Optional(Type.String({ description: "Code snippets, file paths, error messages" })),
 			application: Type.Optional(Type.String({ description: "When/how to apply this in the future" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
 				const entry = await store.save(
 					{
@@ -51,6 +73,7 @@ export default function (pi: ExtensionAPI) {
 					},
 					"manual"
 				);
+				const archivistItem = queueArchivistIfNeeded(ctx, entry);
 
 				const importanceEmoji: Record<string, string> = {
 					critical: "🔴",
@@ -64,10 +87,10 @@ export default function (pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text" as const,
-							text: `${emoji} Reflection captured: "${entry.title}" (${entry.type}, ${entry.importance})\nID: ${entry.id}\nFile: .pi/reflect/reflections/${entry.file}\nTags: ${entry.tags.join(", ")}`,
+							text: `${emoji} Reflection captured: "${entry.title}" (${entry.type}, ${entry.importance})\nID: ${entry.id}\nStore: .pi/reflect/index.jsonl\nDiscovery: .pi/reflect/MEMORY.md\nTags: ${entry.tags.join(", ")}${archivistItem ? `\nArchivist/Inquirer outbox: ${archivistItem.id}` : ""}`,
 						},
 					],
-					details: { entry },
+					details: { entry, archivistItem },
 				};
 			} catch (err) {
 				return {
@@ -83,65 +106,54 @@ export default function (pi: ExtensionAPI) {
 		name: "reflect_search",
 		label: "Reflect Search",
 		description:
-			"Search past reflections and learnings. Use before starting complex tasks to check if relevant insights exist. Returns matching reflections sorted by relevance.",
+			"Search local reflections and shared Sherpa/Reflect nudges. Use before complex tasks to find relevant learnings.",
 		parameters: Type.Object({
-			query: Type.String({ description: "Search query (matches title, summary, tags)" }),
+			query: Type.String({ description: "Search query (matches title, tags, summary, body, context, evidence, and nudges)" }),
+			includeNudges: Type.Optional(Type.Boolean({ description: "Also search shared scratchpad nudges (default true)" })),
 			type: Type.Optional(
 				StringEnum(["knowledge", "process", "automation", "pattern"] as const, {
-					description: "Filter by reflection type",
+					description: "Filter reflection type",
 				})
 			),
 			importance: Type.Optional(
 				StringEnum(["low", "medium", "high", "critical"] as const, {
-					description: "Filter by minimum importance",
+					description: "Filter reflection importance",
 				})
 			),
 			limit: Type.Optional(Type.Number({ description: "Max results (default 10)" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
+				const limit = params.limit ?? 10;
 				const results = store.search(params.query, {
 					type: params.type as ReflectionType | undefined,
 					importance: params.importance as Importance | undefined,
-					limit: params.limit,
+					limit,
 				});
+				const nudges = params.includeNudges === false ? [] : readNudges(scratchpadRoot(ctx.cwd), params.query, limit);
 
-				if (results.length === 0) {
+				if (results.length === 0 && nudges.length === 0) {
 					return {
-						content: [{ type: "text" as const, text: `No reflections found for: "${params.query}"` }],
-						details: { results: [] },
+						content: [{ type: "text" as const, text: `No reflect memory found for: "${params.query}"` }],
+						details: { results: [], nudges: [] },
 					};
 				}
 
-				const importanceEmoji: Record<string, string> = {
-					critical: "🔴",
-					high: "🟠",
-					medium: "🟡",
-					low: "🟢",
-				};
-
-				const formatted = results
-					.map((r, i) => {
+				const importanceEmoji: Record<string, string> = { critical: "🔴", high: "🟠", medium: "🟡", low: "🟢" };
+				const formatted = [
+					...results.map((r, i) => {
 						const emoji = importanceEmoji[r.importance] ?? "💡";
-						return `${i + 1}. ${emoji} **${r.title}** [${r.type}/${r.importance}]\n   ${r.summary}\n   Tags: ${r.tags.join(", ")} | ${r.createdAt.slice(0, 10)}`;
-					})
-					.join("\n\n");
+						return `${i + 1}. ${emoji} **${r.title}** [${r.type}/${r.importance}]\n   ${r.summary}\n   Tags: ${r.tags.join(", ")} | ${r.createdAt.slice(0, 10)}${r.archivistOutboxId ? ` | Archivist: ${r.archivistOutboxId}` : ""}`;
+					}),
+					...nudges.map((n, i) => `${results.length + i + 1}. 📝 **${n.title}** [nudge/${n.target}]\n   ${n.body.replace(/\s+/g, " ").slice(0, 220)}`),
+				].join("\n\n");
 
 				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Found ${results.length} reflection(s) for "${params.query}":\n\n${formatted}`,
-						},
-					],
-					details: { results },
+					content: [{ type: "text" as const, text: `Found ${results.length} reflection(s) and ${nudges.length} nudge(s) for "${params.query}":\n\n${formatted}` }],
+					details: { results, nudges },
 				};
 			} catch (err) {
-				return {
-					content: [{ type: "text" as const, text: `Error searching reflections: ${err}` }],
-					details: {},
-					isError: true,
-				};
+				return { content: [{ type: "text" as const, text: `Error searching reflect memory: ${err}` }], details: {}, isError: true };
 			}
 		},
 	});
@@ -349,6 +361,124 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	function scratchpadRoot(cwd: string): string {
+		return path.join(cwd, ".pi-memory", "scratchpad");
+	}
+
+	function generatedAutomationScripts(cwd: string): Array<{ name: string; path: string; rel: string }> {
+		const root = path.join(cwd, "scripts", "reflect-automations");
+		if (!existsSync(root)) return [];
+		return readdirSync(root)
+			.filter((name) => name.endsWith(".sh"))
+			.map((name) => ({ name, path: path.join(root, name), rel: path.relative(cwd, path.join(root, name)).replace(/\\/g, "/") }))
+			.filter((item) => statSync(item.path).isFile());
+	}
+
+	pi.registerTool({
+		name: "reflect_nudge",
+		label: "Reflect Nudge",
+		description: "Save an observation or distillation candidate into the shared Sherpa/Reflect scratchpad with deduplication. Use for reusable facts, corrections, preferences, and candidate lessons.",
+		parameters: Type.Object({
+			target: StringEnum(["observation", "distill_candidate"] as const),
+			content: Type.String({ description: "Observation, correction, preference, or candidate lesson to remember" }),
+			dedupKey: Type.Optional(Type.String({ description: "Optional deduplication key" })),
+			skipDedup: Type.Optional(Type.Boolean({ description: "Skip deduplication check" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const result = writeNudge(params.target as NudgeTarget, params.content, { scratchpadRoot: scratchpadRoot(ctx.cwd) }, { dedupKey: params.dedupKey, skipDedup: params.skipDedup });
+			const bits = [];
+			if (result.written) bits.push("written");
+			if (result.deduped) bits.push("deduped");
+			if (result.nearDuplicate) bits.push("near-duplicate");
+			if (result.autoCompacted) bits.push("auto-compacted");
+			if (result.capacityWarning) bits.push(result.capacityWarning);
+			return { content: [{ type: "text" as const, text: `Reflect nudge ${bits.join(" | ") || "ok"}\nPath: ${result.path}` }], details: { result } };
+		},
+	});
+
+	pi.registerTool({
+		name: "reflect_run_automation",
+		label: "Reflect Run Automation",
+		description: "Run a script automatically generated by reflect under scripts/reflect-automations/. No manual approval is required for generated scripts.",
+		parameters: Type.Object({
+			name: Type.String({ description: "Generated script filename or repo-relative path. Use 'list' to show available scripts." }),
+			dryRun: Type.Optional(Type.Boolean({ description: "Show command without running" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const scripts = generatedAutomationScripts(ctx.cwd);
+			if (params.name === "list") {
+				return { content: [{ type: "text" as const, text: scripts.length ? scripts.map((s) => `- ${s.rel}`).join("\n") : "No reflect-generated automations." }], details: { scripts } };
+			}
+			const script = scripts.find((s) => s.name === params.name || s.rel === params.name);
+			if (!script) return { content: [{ type: "text" as const, text: `Reflect automation not found: ${params.name}` }], details: { scripts }, isError: true };
+			const command = `bash ${script.rel}`;
+			if (params.dryRun) return { content: [{ type: "text" as const, text: `Dry run: ${command}` }], details: { script, command } };
+			try {
+				const { stdout, stderr } = await execFileAsync("bash", [script.path], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+				return { content: [{ type: "text" as const, text: [stdout.trim(), stderr.trim()].filter(Boolean).join("\n") || "Reflect automation completed with no output" }], details: { script, command } };
+			} catch (error) {
+				return { content: [{ type: "text" as const, text: `Reflect automation failed: ${error instanceof Error ? error.message : String(error)}` }], details: { script, command }, isError: true };
+			}
+		},
+	});
+
+	pi.registerTool({
+		name: "reflect_preserve",
+		label: "Reflect Preserve",
+		description: "Queue an important reflection for Archivist/Inquirer durable memory preservation. Reflect never writes Obsidian memory directly.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Reflection ID to queue for Archivist preservation" }),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const entry = store.getAll().find((item) => item.id === params.id);
+			if (!entry) return { content: [{ type: "text" as const, text: `Reflection not found: ${params.id}` }], isError: true, details: {} };
+			const item = entry.archivistOutboxId
+				? undefined
+				: enqueueArchivistPreserve(ctx.cwd, entry, store.getContent(entry) ?? undefined);
+			if (item) store.markArchivistQueued(entry.id, item.id);
+			return { content: [{ type: "text" as const, text: item ? `Queued for Archivist/Inquirer preservation: ${item.id}` : `Already queued: ${entry.archivistOutboxId}` }], details: { item, shouldPreserve: shouldPreserveReflection(entry) } };
+		},
+	});
+
+
+	pi.registerCommand("reflect:automations", {
+		description: "List reflect-generated automation scripts",
+		handler: async (_args, ctx) => {
+			const scripts = generatedAutomationScripts(ctx.cwd);
+			ctx.ui.notify(scripts.length ? scripts.map((s) => `- ${s.rel}`).join("\n") : "No reflect-generated automations.", "info");
+		},
+	});
+
+	pi.registerCommand("reflect:outbox", {
+		description: "List queued Archivist/Inquirer reflection handoffs",
+		handler: async (_args, ctx) => {
+			const items = readArchivistOutbox(ctx.cwd).slice(-20);
+			ctx.ui.notify(items.length ? items.map((item) => `- ${item.createdAt} [${item.kind}] ${item.id}`).join("\n") : "Reflect Archivist outbox is empty", "info");
+		},
+	});
+
+	pi.registerCommand("reflect:doctor", {
+		description: "Audit reflection storage, discovery, and Archivist handoff state",
+		handler: async (_args, ctx) => {
+			store.refreshDiscoveryFile();
+			const report = store.doctor();
+			const outbox = readArchivistOutbox(ctx.cwd);
+			ctx.ui.notify([
+				"## Reflect Doctor",
+				`Total reflections: ${report.total}`,
+				`Duplicate IDs: ${report.duplicateIds.length}`,
+				`Legacy markdown refs: ${report.legacyMarkdownReferences}`,
+				`Missing legacy markdown: ${report.missingLegacyMarkdown}`,
+				`Rows missing body+summary: ${report.missingBody}`,
+				`High-value not queued to Archivist: ${report.highValueNotQueued}`,
+				`Pending materializations: ${report.pendingMaterializations}`,
+				`Forget candidates: ${report.forgetCandidates}`,
+				`Archivist outbox queued: ${outbox.length}`,
+				`Discovery file: ${report.discoveryFile}`,
+			].join("\n"), report.duplicateIds.length || report.missingBody || report.highValueNotQueued ? "warning" : "info");
+		},
+	});
+
 	// ═════════════════════════════════════════════════════════════════
 	// 2. EVENT HOOKS — Auto-capture from agent behavior
 	// ═════════════════════════════════════════════════════════════════
@@ -356,7 +486,8 @@ export default function (pi: ExtensionAPI) {
 	// After each agent prompt — analyze for capturable patterns, queue for review
 	pi.on("agent_end", async (event, ctx) => {
 		try {
-			const messages = (event as any).messages;
+			if ((event as any).willRetry === true) return;
+			const messages = (event as any).messages ?? ctx.sessionManager.getEntries().slice(-12);
 			if (!messages || !Array.isArray(messages)) return;
 
 			const insights = analyzeForReflections(messages);
@@ -367,6 +498,9 @@ export default function (pi: ExtensionAPI) {
 			if (insights.length > 0 && ctx.hasUI) {
 				updateReviewWidget(ctx);
 			}
+
+			await runPostTaskLearning(ctx, learningState, messages);
+			persistLearningState();
 		} catch {
 			// Silent — don't interrupt agent flow
 		}
@@ -871,6 +1005,18 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		try {
 			lastCtx = ctx;
+			store = new ReflectionStore(ctx.cwd);
+			const normalized = store.normalizeStore();
+			const forgotten = store.forget(90, true);
+			store.refreshDiscoveryFile();
+			if (normalized.updated > 0 && ctx.hasUI) ctx.ui.notify(`Reflect normalized ${normalized.updated} legacy store field(s)`, "info");
+			if (forgotten.archived > 0 && ctx.hasUI) ctx.ui.notify(`Reflect archived ${forgotten.archived} stale reflection(s) to ${forgotten.archivePath}`, "info");
+			learningState = createReflectLearningState();
+			for (const entry of ctx.sessionManager.getEntries() as any[]) {
+				if (entry.type === "custom" && entry.customType === "pi-reflect-state" && entry.data) {
+					applyPersistedReflectLearningState(learningState, entry.data);
+				}
+			}
 			if (!ctx.hasUI) return;
 
 			// Load pending materializations into review queue
@@ -890,7 +1036,7 @@ export default function (pi: ExtensionAPI) {
 	// ═════════════════════════════════════════════════════════════════
 
 	pi.registerCommand("reflect", {
-		description: "Browse, search, or manage reflections. Usage: /reflect [stats|recent|pending|apply <id>|search <query>]",
+		description: "Browse, search, or manage reflections. Usage: /reflect [stats|doctor|forget|recent|pending|apply <id>|search <query>]",
 		handler: async (args, ctx) => {
 			try {
 				const subcommand = args?.trim().split(/\s+/)[0] ?? "";
@@ -927,6 +1073,25 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(lines.join("\n"), "info");
 						break;
 					}
+					case "doctor": {
+						store.refreshDiscoveryFile();
+						const report = store.doctor();
+						const outbox = readArchivistOutbox(ctx.cwd);
+						ctx.ui.notify([
+							"## Reflect Doctor",
+							`Total reflections: ${report.total}`,
+							`Duplicate IDs: ${report.duplicateIds.length}`,
+							`Legacy markdown refs: ${report.legacyMarkdownReferences}`,
+							`Missing legacy markdown: ${report.missingLegacyMarkdown}`,
+							`Rows missing body+summary: ${report.missingBody}`,
+							`High-value not queued to Archivist: ${report.highValueNotQueued}`,
+							`Pending materializations: ${report.pendingMaterializations}`,
+							`Forget candidates: ${report.forgetCandidates}`,
+							`Archivist outbox queued: ${outbox.length}`,
+							`Discovery file: ${report.discoveryFile}`,
+						].join("\n"), report.duplicateIds.length || report.missingBody || report.highValueNotQueued ? "warning" : "info");
+						break;
+					}
 					case "recent": {
 						const limit = parseInt(rest) || 10;
 						const recent = store.recent(limit);
@@ -939,6 +1104,26 @@ export default function (pi: ExtensionAPI) {
 							return `${mat} ${r.createdAt.slice(0, 10)} [${r.type}] ${r.title} (${r.importance})`;
 						});
 						ctx.ui.notify(`Recent reflections:\n\n${lines.join("\n")}`, "info");
+						break;
+					}
+					case "automations": {
+						const scripts = generatedAutomationScripts(ctx.cwd);
+						ctx.ui.notify(scripts.length ? scripts.map((s) => `- ${s.rel}`).join("\n") : "No reflect-generated automations.", "info");
+						break;
+					}
+					case "forget": {
+						const parts = rest.split(/\s+/).filter(Boolean);
+						const apply = parts.includes("apply") || parts.includes("--apply");
+						const days = Number(parts.find((part) => /^\d+$/.test(part)) ?? 90);
+						const result = store.forget(days, apply);
+						ctx.ui.notify([
+							`Reflect forgetting (${days} days):`,
+							`Candidates: ${result.candidates}`,
+							`Archived: ${result.archived}`,
+							`Mode: ${result.dryRun ? "dry-run" : "applied"}`,
+							result.archivePath ? `Archive: ${result.archivePath}` : "",
+							!apply ? "Run `/reflect forget apply [days]` to archive candidates." : "",
+						].filter(Boolean).join("\n"), result.candidates ? "warning" : "info");
 						break;
 					}
 					case "pending": {
@@ -1012,6 +1197,9 @@ export default function (pi: ExtensionAPI) {
 								``,
 								`Commands:`,
 								`  /reflect stats          — Show statistics`,
+								`  /reflect doctor         — Audit storage/discovery/handoffs`,
+								`  /reflect automations    — List generated automation scripts`,
+								`  /reflect forget [apply] — Archive stale low-value reflections`,
 								`  /reflect recent [N]     — Show last N reflections`,
 								`  /reflect pending        — Show pending materializations`,
 								`  /reflect apply <id>     — Materialize a pending reflection`,

@@ -7,7 +7,7 @@ import * as crypto from "node:crypto";
 export type ReflectionType = "knowledge" | "process" | "automation" | "pattern";
 export type Importance = "low" | "medium" | "high" | "critical";
 export type Confidence = "low" | "medium" | "high";
-export type Source = "manual" | "auto-agent-end" | "auto-compact" | "auto-tree" | "migration";
+export type Source = "manual" | "auto-agent-end" | "auto-compact" | "auto-tree" | "auto-automation" | "auto-distill" | "migration";
 
 /** What kind of file the reflection materializes into */
 export type TargetType = "user_script" | "module_readme" | "project_skill" | "config_file" | "none";
@@ -29,12 +29,22 @@ export interface ReflectionEntry {
 	type: ReflectionType;
 	title: string;
 	summary: string;
+	/** Self-contained searchable learning body. Markdown files are convenience artifacts, not the lookup source of truth. */
+	body?: string;
+	context?: string;
+	evidence?: string;
+	application?: string;
+	verification?: string;
 	importance: Importance;
 	tags: string[];
 	file: string;
 	createdAt: string;
 	source: Source;
 	sessionId?: string;
+	archivistQueuedAt?: string;
+	archivistOutboxId?: string;
+	accessCount?: number;
+	lastAccessedAt?: string;
 	/** Materialization fields */
 	mode?: Mode;
 	confidence?: Confidence;
@@ -91,17 +101,40 @@ export interface DeleteResult {
 	file?: string;
 }
 
+export type ReflectionDoctorReport = {
+	total: number;
+	duplicateIds: string[];
+	legacyMarkdownReferences: number;
+	missingLegacyMarkdown: number;
+	missingBody: number;
+	highValueNotQueued: number;
+	pendingMaterializations: number;
+	forgetCandidates: number;
+	discoveryFile: string;
+};
+
+export type ForgetResult = {
+	candidates: number;
+	archived: number;
+	archivePath?: string;
+	dryRun: boolean;
+};
+
 // ─── Store ───────────────────────────────────────────────────────────
 
 export class ReflectionStore {
 	private reflectDir: string;
 	private indexFile: string;
+	private discoveryFile: string;
+	private automationsFile: string;
 	private reflectionsDir: string;
 	private cache: ReflectionEntry[] | null = null;
 
 	constructor(projectRoot: string) {
 		this.reflectDir = path.join(projectRoot, ".pi", "reflect");
 		this.indexFile = path.join(this.reflectDir, "index.jsonl");
+		this.discoveryFile = path.join(this.reflectDir, "MEMORY.md");
+		this.automationsFile = path.join(this.reflectDir, "AUTOMATIONS.md");
 		this.reflectionsDir = path.join(this.reflectDir, "reflections");
 		this.ensureDirs();
 	}
@@ -148,19 +181,21 @@ export class ReflectionStore {
 	): Promise<ReflectionEntry> {
 		const now = new Date();
 		const id = this.generateId(now);
-		const slug = this.slugify(input.title);
-		const fileName = `${this.formatDate(now)}_${input.type}_${slug}.md`;
+		// Reflection rows are self-contained. Per-reflection markdown files are no longer
+		// written by default; `getContent()` renders markdown from JSONL on demand.
+		const fileName = "";
 
-		// Write full markdown file
-		const markdown = this.renderMarkdown(input, source, now);
-		fs.writeFileSync(path.join(this.reflectionsDir, fileName), markdown);
-
-		// Append to index
+		// Append to canonical store
 		const entry: ReflectionEntry = {
 			id,
 			type: input.type,
 			title: input.title,
-			summary: input.content.slice(0, 200),
+			summary: input.content.slice(0, 240),
+			body: input.content,
+			...(input.context && { context: input.context }),
+			...(input.evidence && { evidence: input.evidence }),
+			...(input.application && { application: input.application }),
+			...(input.verification && { verification: input.verification }),
 			importance: input.importance,
 			tags: input.tags.map((t) => t.toLowerCase()),
 			file: fileName,
@@ -175,6 +210,7 @@ export class ReflectionStore {
 
 		fs.appendFileSync(this.indexFile, JSON.stringify(entry) + "\n");
 		this.cache = null; // Invalidate cache
+		this.rebuildDiscoveryFile();
 
 		// Auto-materialize if mode is "execute"
 		if (input.mode === "execute" && input.target && input.target.targetType !== "none") {
@@ -272,18 +308,31 @@ export class ReflectionStore {
 	/**
 	 * Rewrite index to mark an entry as materialized.
 	 */
+	private rewriteIndex(entries: ReflectionEntry[]): void {
+		const content = entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : "");
+		fs.writeFileSync(this.indexFile, content);
+		this.cache = null;
+		this.rebuildDiscoveryFile();
+		this.rebuildAutomationsFile();
+	}
+
 	private markMaterialized(id: string): void {
 		const entries = this.loadIndex();
 		const now = new Date().toISOString();
-		const updated = entries.map((e) => {
-			if (e.id === id) return { ...e, materialized: true, materializedAt: now };
-			return e;
-		});
+		this.rewriteIndex(entries.map((e) => e.id === id ? { ...e, materialized: true, materializedAt: now } : e));
+	}
 
-		// Rewrite index
-		const content = updated.map((e) => JSON.stringify(e)).join("\n") + "\n";
-		fs.writeFileSync(this.indexFile, content);
-		this.cache = null;
+	markArchivistQueued(id: string, outboxId: string): void {
+		const entries = this.loadIndex();
+		const now = new Date().toISOString();
+		this.rewriteIndex(entries.map((e) => e.id === id ? { ...e, archivistQueuedAt: now, archivistOutboxId: outboxId } : e));
+	}
+
+	private markAccessed(ids: string[]): void {
+		const idSet = new Set(ids);
+		const now = new Date().toISOString();
+		const entries = this.loadIndex();
+		this.rewriteIndex(entries.map((e) => idSet.has(e.id) ? { ...e, accessCount: (e.accessCount ?? 0) + 1, lastAccessedAt: now } : e));
 	}
 
 	/**
@@ -297,9 +346,9 @@ export class ReflectionStore {
 		}
 
 		try {
-			// Remove file if exists
-			const filePath = path.join(this.reflectionsDir, entry.file);
-			if (fs.existsSync(filePath)) {
+			// Remove legacy convenience markdown file if this old entry references one.
+			const filePath = entry.file ? path.join(this.reflectionsDir, entry.file) : "";
+			if (filePath && fs.existsSync(filePath)) {
 				fs.unlinkSync(filePath);
 			}
 
@@ -308,6 +357,7 @@ export class ReflectionStore {
 			const content = updated.map((e) => JSON.stringify(e)).join("\n") + (updated.length ? "\n" : "");
 			fs.writeFileSync(this.indexFile, content);
 			this.cache = null;
+			this.rebuildDiscoveryFile();
 
 			return { success: true, file: entry.file };
 		} catch (err) {
@@ -348,11 +398,15 @@ export class ReflectionStore {
 					if (entry.tags.some((t) => t.includes(term))) score += 5;
 				}
 
-				// Summary match
-				const summaryLower = entry.summary.toLowerCase();
+				// Summary/body/context match
+				const searchableLower = [entry.summary, entry.body, entry.context, entry.evidence, entry.application, entry.verification]
+					.filter(Boolean)
+					.join("\n")
+					.toLowerCase();
 				for (const term of queryTerms) {
-					if (summaryLower.includes(term)) score += 3;
+					if (searchableLower.includes(term)) score += 3;
 				}
+				if (searchableLower.includes(queryLower)) score += 8;
 
 				// Importance boost
 				const importanceBoost: Record<Importance, number> = {
@@ -373,15 +427,18 @@ export class ReflectionStore {
 			.sort((a, b) => b.score - a.score)
 			.slice(0, limit);
 
-		return scored.map((s) => s.entry);
+		const results = scored.map((s) => s.entry);
+		if (results.length) this.markAccessed(results.map((entry) => entry.id));
+		return results;
 	}
 
 	// ─── Read Full Content ─────────────────────────────────────────
 
 	getContent(entry: ReflectionEntry): string | null {
 		const filePath = path.join(this.reflectionsDir, entry.file);
-		if (!fs.existsSync(filePath)) return null;
-		return fs.readFileSync(filePath, "utf-8");
+		if (fs.existsSync(filePath)) return fs.readFileSync(filePath, "utf-8");
+		if (!entry.body && !entry.summary) return null;
+		return this.renderEntryMarkdown(entry);
 	}
 
 	// ─── Stats ─────────────────────────────────────────────────────
@@ -434,6 +491,82 @@ export class ReflectionStore {
 		return this.loadIndex();
 	}
 
+	refreshDiscoveryFile(): void {
+		this.rebuildDiscoveryFile();
+		this.rebuildAutomationsFile();
+	}
+
+	normalizeStore(): { updated: number } {
+		const entries = this.loadIndex();
+		let updated = 0;
+		const normalized = entries.map((entry) => {
+			let next = entry;
+			if (!next.body && next.summary) {
+				next = { ...next, body: next.summary };
+				updated++;
+			}
+			if (next.file && !fs.existsSync(path.join(this.reflectionsDir, next.file))) {
+				next = { ...next, file: "" };
+				updated++;
+			}
+			return next;
+		});
+		if (updated > 0) this.rewriteIndex(normalized);
+		else this.refreshDiscoveryFile();
+		return { updated };
+	}
+
+	doctor(): ReflectionDoctorReport {
+		const entries = this.loadIndex();
+		const seen = new Set<string>();
+		const duplicateIds = new Set<string>();
+		let legacyMarkdownReferences = 0;
+		let missingLegacyMarkdown = 0;
+		let missingBody = 0;
+		let highValueNotQueued = 0;
+		let pendingMaterializations = 0;
+		let forgetCandidates = 0;
+		for (const entry of entries) {
+			if (seen.has(entry.id)) duplicateIds.add(entry.id);
+			seen.add(entry.id);
+			if (entry.file) {
+				legacyMarkdownReferences++;
+				if (!fs.existsSync(path.join(this.reflectionsDir, entry.file))) missingLegacyMarkdown++;
+			}
+			if (!entry.body && !entry.summary) missingBody++;
+			if ((entry.importance === "critical" || entry.importance === "high" || entry.tags.includes("micro-skill") || entry.tags.includes("durable")) && !entry.archivistOutboxId) highValueNotQueued++;
+			if (entry.target && entry.target.targetType !== "none" && !entry.materialized) pendingMaterializations++;
+			if (this.shouldForget(entry, 90)) forgetCandidates++;
+		}
+		return { total: entries.length, duplicateIds: [...duplicateIds], legacyMarkdownReferences, missingLegacyMarkdown, missingBody, highValueNotQueued, pendingMaterializations, forgetCandidates, discoveryFile: this.discoveryFile };
+	}
+
+	forget(days = 90, apply = false): ForgetResult {
+		const entries = this.loadIndex();
+		const candidates = entries.filter((entry) => this.shouldForget(entry, days));
+		if (!apply || candidates.length === 0) return { candidates: candidates.length, archived: 0, dryRun: true };
+
+		const archiveDir = path.join(this.reflectDir, "archive");
+		fs.mkdirSync(archiveDir, { recursive: true });
+		const archivePath = path.join(archiveDir, `forgotten-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`);
+		fs.writeFileSync(archivePath, candidates.map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf8");
+		const candidateIds = new Set(candidates.map((entry) => entry.id));
+		this.rewriteIndex(entries.filter((entry) => !candidateIds.has(entry.id)));
+		return { candidates: candidates.length, archived: candidates.length, archivePath, dryRun: false };
+	}
+
+	private shouldForget(entry: ReflectionEntry, days: number): boolean {
+		if (entry.importance === "critical" || entry.importance === "high") return false;
+		if (entry.archivistOutboxId) return false;
+		if (entry.target && entry.target.targetType !== "none") return false;
+		if (entry.materialized) return false;
+		if (entry.tags.some((tag) => ["durable", "micro-skill", "automation-candidate", "auto-distill"].includes(tag))) return false;
+		const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
+		const lastUseful = Date.parse(entry.lastAccessedAt ?? entry.createdAt);
+		if (Number.isNaN(lastUseful) || lastUseful > cutoff) return false;
+		return entry.source.startsWith("auto-") || (entry.accessCount ?? 0) === 0;
+	}
+
 	// ─── Helpers ───────────────────────────────────────────────────
 
 	private generateId(date: Date): string {
@@ -452,6 +585,87 @@ export class ReflectionStore {
 			.replace(/[^a-z0-9]+/g, "-")
 			.replace(/^-|-$/g, "")
 			.slice(0, 50);
+	}
+
+	private rebuildDiscoveryFile(): void {
+		const all = this.loadIndex().sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+		const critical = all.filter((entry) => entry.importance === "critical").slice(0, 15);
+		const high = all.filter((entry) => entry.importance === "high").slice(0, 25);
+		const microSkills = all.filter((entry) => entry.tags.includes("micro-skill") || entry.target?.targetType === "project_skill").slice(0, 20);
+		const handoffs = all.filter((entry) => entry.archivistOutboxId).slice(0, 20);
+
+		const render = (entry: ReflectionEntry) => [
+			`### ${entry.title}`,
+			`- ID: ${entry.id}`,
+			`- Type: ${entry.type}`,
+			`- Importance: ${entry.importance}`,
+			`- Tags: ${entry.tags.join(", ")}`,
+			entry.archivistOutboxId ? `- Archivist outbox: ${entry.archivistOutboxId}` : "- Archivist outbox: not queued",
+			"",
+			(entry.body ?? entry.summary ?? "").slice(0, 700),
+			"",
+		];
+
+		const section = (title: string, entries: ReflectionEntry[]) => [
+			`## ${title}`,
+			"",
+			...(entries.length ? entries.flatMap(render) : ["None.", ""]),
+		];
+
+		const lines = [
+			"# Reflect Memory",
+			"",
+			"Generated from `.pi/reflect/index.jsonl` for fast project-local runtime discovery.",
+			"Canonical durable Obsidian memory must be written by Archivist/Inquirer, not by reflect.",
+			"",
+			...section("Critical", critical),
+			...section("High Value", high),
+			...section("Pending Micro-skills", microSkills.filter((entry) => !entry.materialized)),
+			...section("Archivist Handoffs", handoffs),
+		];
+		fs.writeFileSync(this.discoveryFile, lines.join("\n"));
+	}
+
+	private rebuildAutomationsFile(): void {
+		const entries = this.loadIndex()
+			.filter((entry) => entry.type === "automation" && entry.target?.targetType === "user_script")
+			.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+		const lines = [
+			"# Reflect Automations",
+			"",
+			"Generated from `.pi/reflect/index.jsonl`. Scripts are created automatically from repeated workflows.",
+			"Sherpa discovers generated scripts under `scripts/reflect-automations/` recursively.",
+			"",
+			...(entries.length ? entries.flatMap((entry) => [
+				`## ${entry.title}`,
+				`- ID: ${entry.id}`,
+				`- Script: ${entry.target?.targetPath ?? "unknown"}`,
+				`- Materialized: ${entry.materialized ? "yes" : "no"}`,
+				`- Command source: ${entry.evidence ?? "unknown"}`,
+				`- Last accessed: ${entry.lastAccessedAt ?? "never"}`,
+				"",
+			]) : ["None.", ""]),
+		];
+		fs.writeFileSync(this.automationsFile, lines.join("\n"));
+	}
+
+	private renderEntryMarkdown(entry: ReflectionEntry): string {
+		const lines = [
+			`# ${entry.title}`,
+			"",
+			`**Type:** ${entry.type}`,
+			`**Importance:** ${entry.importance}`,
+			`**Tags:** ${entry.tags.join(", ")}`,
+			`**Source:** ${entry.source}`,
+			`**Created:** ${entry.createdAt}`,
+			"",
+		];
+		if (entry.context) lines.push("## Context", "", entry.context, "");
+		lines.push("## Learning", "", entry.body ?? entry.summary, "");
+		if (entry.evidence) lines.push("## Evidence", "", entry.evidence, "");
+		if (entry.application) lines.push("## Application", "", entry.application, "");
+		if (entry.verification) lines.push("## Verification", "", entry.verification, "");
+		return lines.join("\n");
 	}
 
 	private renderMarkdown(input: ReflectionContent, source: Source, date: Date): string {
