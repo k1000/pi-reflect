@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -380,16 +380,55 @@ export default function (pi: ExtensionAPI) {
 		}).filter((item): item is AutomationRunRecord => Boolean(item));
 	}
 
+	function automationSlug(value: string): string {
+		return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "reflect-automation";
+	}
+
+	function automationSkillPath(cwd: string, rel: string): string {
+		return path.join(cwd, ".pi", "skills", `reflect-${automationSlug(path.basename(rel, ".sh"))}`, "SKILL.md");
+	}
+
 	function automationRunSummary(cwd: string, rel: string): string {
 		const runs = readAutomationRuns(cwd).filter((run) => run.script === rel);
-		if (!runs.length) return "runs=0";
+		const promoted = existsSync(automationSkillPath(cwd, rel));
+		if (!runs.length) return `runs=0 promoted=${promoted ? "yes" : "no"}`;
 		const failures = runs.filter((run) => run.status === "failed").length;
 		const last = runs[runs.length - 1]!;
-		return `runs=${runs.length} failures=${failures} last=${last.status}`;
+		return `runs=${runs.length} failures=${failures} last=${last.status} promoted=${promoted ? "yes" : "no"}`;
 	}
 
 	function recordAutomationRun(cwd: string, record: AutomationRunRecord): void {
 		appendFileSync(automationRunLogPath(cwd), JSON.stringify(record) + "\n", "utf8");
+	}
+
+	function maybePromoteAutomation(cwd: string, rel: string): string | null {
+		const runs = readAutomationRuns(cwd).filter((run) => run.script === rel);
+		const passed = runs.filter((run) => run.status === "passed").length;
+		if (passed < 3) return null;
+		const skillPath = automationSkillPath(cwd, rel);
+		if (existsSync(skillPath)) return skillPath;
+		mkdirSync(path.dirname(skillPath), { recursive: true });
+		writeFileSync(skillPath, [
+			`# Reflect Automation: ${path.basename(rel, ".sh")}`,
+			"",
+			"Automatically promoted after three successful reflect automation runs.",
+			"",
+			"## When to use",
+			`Use when the task calls for the repeated workflow captured in \`${rel}\`.`,
+			"",
+			"## Procedure",
+			`Run \`reflect_run_automation({ name: \"${rel}\" })\` or execute:`,
+			"",
+			"```bash",
+			`bash ${rel}`,
+			"```",
+			"",
+			"## Promotion evidence",
+			`- Successful runs: ${passed}`,
+			`- Promoted at: ${new Date().toISOString()}`,
+			"",
+		].join("\n"), "utf8");
+		return skillPath;
 	}
 
 	function generatedAutomationScripts(cwd: string): Array<{ name: string; path: string; rel: string; summary: string }> {
@@ -476,7 +515,9 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const { stdout, stderr } = await execFileAsync("bash", [script.path], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
 				recordAutomationRun(ctx.cwd, { script: script.rel, status: "passed", durationMs: Date.now() - started, at: new Date().toISOString() });
-				return { content: [{ type: "text" as const, text: [stdout.trim(), stderr.trim()].filter(Boolean).join("\n") || "Reflect automation completed with no output" }], details: { script, command } };
+				const promoted = maybePromoteAutomation(ctx.cwd, script.rel);
+				const output = [stdout.trim(), stderr.trim(), promoted ? `Promoted automation skill: ${promoted}` : ""].filter(Boolean).join("\n") || "Reflect automation completed with no output";
+				return { content: [{ type: "text" as const, text: output }], details: { script, command, promoted } };
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				recordAutomationRun(ctx.cwd, { script: script.rel, status: "failed", durationMs: Date.now() - started, at: new Date().toISOString(), error: message.slice(0, 500) });

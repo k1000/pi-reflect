@@ -1,6 +1,6 @@
 # pi-reflect — Development Learning & Materialization Extension
 
-A pi extension that captures, stores, searches, and materializes development reflections. Turns lessons learned into persistent, searchable knowledge — and optionally into real project files (scripts, docs, skills).
+A pi extension that captures, stores, searches, materializes, and maintains development reflections. Turns lessons learned into project-local memory, automatically creates reusable scripts from repeated workflows, queues durable memory handoffs for Archivist/Inquirer, and forgets stale low-value reflections.
 
 ## Installation
 
@@ -52,11 +52,18 @@ Then restart pi.
 
 ```
 ~/.pi/agent/extensions/reflect/
-├── index.ts          # Extension entry point
-├── store.ts          # JSONL storage + search + materialization engine
+├── index.ts          # Extension entry point, tools, commands, hooks
+├── store.ts          # Self-contained JSONL store, search, forgetting, discovery files
 ├── capture.ts        # Auto-capture pattern detection from agent behavior
+├── automation.ts     # Repeated-command detection and automation candidates
+├── learning.ts       # Post-task learning pipeline
+├── archivist.ts      # Archivist/Inquirer outbox handoff queue
+├── nudge.ts          # Shared Sherpa/Reflect scratchpad nudges
+├── auto-distill.ts   # Scratchpad distill-candidate trigger logic
+├── distillation.ts   # Distill payload type; no direct Obsidian writes
 ├── review.ts         # Interactive review queue
-├── package.json      # Dependencies (@sinclair/typebox, pi packages)
+├── scripts/          # check and maintenance automations
+├── package.json      # Dependencies and scripts
 └── node_modules/     # Installed dependencies
 ```
 
@@ -66,15 +73,16 @@ Each project stores its own reflections. When pi starts, the extension reads fro
 
 ```
 <project>/.pi/reflect/
-├── index.jsonl       # Lightweight index (one JSON per line)
-├── patterns.md       # Auto-maintained summary of key patterns
-└── reflections/      # Full markdown reflection files
-    ├── 2026-01-19_knowledge_business-rules.md
-    ├── 2026-01-27_process_dependency-check.md
-    └── ...
+├── index.jsonl              # Canonical self-contained reflection store (JSONL)
+├── MEMORY.md                # Generated compact high-value discovery file
+├── AUTOMATIONS.md           # Generated registry of reflect-created scripts
+├── archivist-outbox.jsonl   # Durable memory handoffs for Archivist/Inquirer
+├── automation-runs.jsonl    # Run telemetry for reflect-generated scripts
+├── archive/                 # Forgotten low-value reflection archives
+└── reflections/             # Legacy/convenience markdown only; not canonical
 ```
 
-To initialize a new project, just start using the tools — the directory is created automatically.
+To initialize a new project, just start using the tools — the directory is created automatically. The canonical source of truth is `index.jsonl`; Markdown files are generated convenience artifacts only.
 
 ### Optional Skill (Per-Project)
 
@@ -117,7 +125,7 @@ GitHub releases are published for each tag (see the Releases page).
 │  │ index.ts │  │ store.ts │  │capture.ts│  │review.ts│ │
 │  │ Tools    │  │ Storage  │  │ Auto-    │  │ Review  │ │
 │  │ Hooks    │  │ Search   │  │ detect   │  │ Queue   │ │
-│  │ Commands │  │ Materiel │  │ patterns │  │ Widget  │ │
+│  │ Commands │  │ Forget   │  │ patterns │  │ Widget  │ │
 │  │ Shortcut │  │ ize      │  │          │  │ Panel   │ │
 │  └──────────┘  └──────────┘  └──────────┘  └─────────┘ │
 └──────────────────────┬──────────────────────────────────┘
@@ -125,7 +133,7 @@ GitHub releases are published for each tag (see the Releases page).
                        ▼
           ┌─────────────────────────┐
           │  <project>/.pi/reflect/  │
-          │  index.jsonl + files    │
+          │  index + generated docs │
           └─────────────────────────┘
 ```
 
@@ -134,8 +142,8 @@ GitHub releases are published for each tag (see the Releases page).
 ```
 1. CAPTURE (automatic or manual)
    Agent works → agent_end hook detects patterns → store.save()
-   Repeated shell/tool workflows → automation candidate reflection → store.save()
-   Completed task + scratchpad distill candidates → durable distilled procedure + store.save()
+   Repeated shell/tool workflows → generated script + reflection → store.save()
+   Completed task + scratchpad distill candidates → Archivist outbox + store.save()
    Compaction triggers → session_before_compact → extract learnings → store.save()
    Tree navigation → session_tree → branch summary → store.save()
    LLM calls reflect_capture or reflect_materialize → store.save()
@@ -149,9 +157,18 @@ GitHub releases are published for each tag (see the Releases page).
    User types prompt → before_agent_start → search store → inject top-3 into system prompt
    Ralph loop starts → tool_call hook → inject relevant reflections
 
-4. MATERIALIZE (file creation)
+4. MATERIALIZE / AUTOMATE
    Reflection with target → mode=execute → file written immediately
-   Reflection with target → mode=plan → pending → user runs reflect_apply or /reflect apply
+   Repeated safe workflows → scripts/reflect-automations/*.sh + package.json script
+   reflect_run_automation → runs generated scripts and records telemetry
+
+5. MAINTAIN / FORGET
+   reflect maintenance → normalize store, refresh MEMORY/AUTOMATIONS, archive stale low-value rows
+   Search hits update accessCount/lastAccessedAt so useful memories stay alive
+
+6. DURABLE MEMORY HANDOFF
+   High-value reflections and distillation payloads → .pi/reflect/archivist-outbox.jsonl
+   Archivist/Inquirer owns all Obsidian durable writes
 ```
 
 ---
@@ -195,13 +212,14 @@ reflect_materialize({
 
 ### reflect_search
 
-Search past reflections before starting a task.
+Search past reflections and, by default, shared Sherpa/Reflect scratchpad nudges before starting a task. Search hits update access telemetry (`accessCount`, `lastAccessedAt`) so useful memories are less likely to be forgotten.
 
 ```
 reflect_search({
   query: "migration staging",
-  type: "process",             // optional filter
-  limit: 5                     // optional, default 10
+  includeNudges: true,          // optional, default true
+  type: "process",             // optional reflection filter
+  limit: 5                      // optional, default 10
 })
 ```
 
@@ -216,6 +234,57 @@ reflect_apply({
 })
 ```
 
+### reflect_nudge
+
+Write an observation or distillation candidate to the shared Sherpa/Reflect scratchpad with deduplication.
+
+```
+reflect_nudge({
+  target: "observation",        // observation | distill_candidate
+  content: "User prefers automated memory maintenance over manual review",
+  dedupKey: "memory-maintenance" // optional
+})
+```
+
+### reflect_run_automation
+
+Run a script generated by Reflect under `scripts/reflect-automations/`. Use `name: "list"` to inspect available scripts and run telemetry.
+
+```
+reflect_run_automation({
+  name: "list"
+})
+
+reflect_run_automation({
+  name: "scripts/reflect-automations/check-example-abcd1234.sh"
+})
+```
+
+Each run appends telemetry to `.pi/reflect/automation-runs.jsonl`. After repeated successful runs, the automation can be promoted into a project skill.
+
+### reflect_maintenance
+
+Normalize and maintain project reflection memory.
+
+```
+reflect_maintenance({
+  days: 90,
+  dryRun: false
+})
+```
+
+This normalizes legacy rows, refreshes discovery files, and archives stale low-value memories.
+
+### reflect_preserve
+
+Queue a reflection for Archivist/Inquirer durable memory preservation. Reflect never writes Obsidian memory directly.
+
+```
+reflect_preserve({
+  id: "ref_20260204_143022_abc123"
+})
+```
+
 ---
 
 ## Commands (for user)
@@ -224,11 +293,60 @@ reflect_apply({
 |---------|-------------|
 | `/reflect` | Show help and stats |
 | `/reflect stats` | Breakdown by type, importance, pending count |
+| `/reflect doctor` or `/reflect:doctor` | Audit storage, discovery files, forgetting, and Archivist handoffs |
+| `/reflect maintenance` or `/reflect:maintenance` | Normalize, forget stale low-value rows, refresh discovery files |
+| `/reflect automations` or `/reflect:automations` | List generated automation scripts and run telemetry |
 | `/reflect recent [N]` | Last N reflections (default 10) with status icons |
 | `/reflect pending` | Show reflections awaiting materialization |
 | `/reflect apply <id>` | Materialize a pending reflection |
-| `/reflect search <query>` | Search by keyword |
+| `/reflect search <query>` | Search reflections by keyword |
+| `/reflect forget [apply] [days]` | Dry-run or apply age/use-based forgetting |
+| `/reflect:outbox` | Show queued Archivist/Inquirer durable memory handoffs |
 | `/review` | Open interactive review panel |
+
+---
+
+## Automation Policy
+
+Reflect automates repeated workflows without requiring manual approval:
+
+- repeated commands are detected from session/tool history
+- generated scripts are written to `scripts/reflect-automations/*.sh`
+- scripts include Sherpa metadata headers such as `@sherpa-purpose`, `@sherpa-safe`, and `@sherpa-side-effects`
+- safe generated scripts are also registered in project `package.json` as `reflect:<name>` when possible
+- `reflect_run_automation` can run generated scripts directly
+- run telemetry is stored in `.pi/reflect/automation-runs.jsonl`
+
+Reflect still refuses obviously unsafe command patterns such as `rm -rf`, `git reset --hard`, `git clean`, `drop database`, `truncate table`, and `db:push`.
+
+## Memory And Forgetting
+
+Reflect uses a project-local memory lifecycle:
+
+1. **Scratchpad / nudge** — raw short-term observations in `.pi-memory/scratchpad/`.
+2. **Reflection** — local searchable memory in `.pi/reflect/index.jsonl`.
+3. **Automation** — executable scripts in `scripts/reflect-automations/`.
+4. **Archivist outbox** — durable memory handoffs in `.pi/reflect/archivist-outbox.jsonl`.
+5. **Archivist/Inquirer** — the only path that may write durable Obsidian memory.
+
+Forgetting is intentional. Reflect archives stale low-value reflections when they are old, unused, auto-captured, and not high-value, not durable, not materialized, and not queued to Archivist. Forgotten rows are moved to `.pi/reflect/archive/forgotten-*.jsonl`.
+
+Search results update access telemetry, so frequently used memories stay active.
+
+## Maintenance Automation
+
+From the extension directory:
+
+```bash
+bun run check
+REFLECT_CHECK_CWD=/path/to/project bun run check
+
+bun run maintain
+REFLECT_MAINTAIN_CWD=/path/to/project bun run maintain
+REFLECT_FORGET_DAYS=60 REFLECT_FORGET_APPLY=false bun run maintain
+```
+
+`check` validates bundle health and store invariants. `maintain` normalizes the store, applies forgetting, and refreshes generated discovery files.
 
 ---
 
