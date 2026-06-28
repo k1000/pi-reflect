@@ -375,6 +375,34 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerTool({
+		name: "reflect_maintenance",
+		label: "Reflect Maintenance",
+		description: "Run automated pi-reflect memory maintenance: normalize store, archive stale low-value reflections, and refresh MEMORY/AUTOMATIONS discovery files.",
+		parameters: Type.Object({
+			days: Type.Optional(Type.Number({ description: "Forget threshold in days (default 90)" })),
+			dryRun: Type.Optional(Type.Boolean({ description: "If true, report forget candidates without archiving" })),
+		}),
+		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const normalized = store.normalizeStore();
+			const forgotten = store.forget(params.days ?? 90, params.dryRun !== true);
+			store.refreshDiscoveryFile();
+			const report = store.doctor();
+			return {
+				content: [{ type: "text" as const, text: [
+					"Reflect maintenance complete",
+					`Normalized fields: ${normalized.updated}`,
+					`Forget candidates: ${forgotten.candidates}`,
+					`Archived: ${forgotten.archived}`,
+					forgotten.archivePath ? `Archive: ${forgotten.archivePath}` : "",
+					`Total reflections: ${report.total}`,
+					`High-value not queued: ${report.highValueNotQueued}`,
+				].filter(Boolean).join("\n") }],
+				details: { normalized, forgotten, report },
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "reflect_nudge",
 		label: "Reflect Nudge",
 		description: "Save an observation or distillation candidate into the shared Sherpa/Reflect scratchpad with deduplication. Use for reusable facts, corrections, preferences, and candidate lessons.",
@@ -440,6 +468,28 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+
+	pi.registerCommand("reflect:maintenance", {
+		description: "Run automated reflect memory maintenance",
+		handler: async (args, ctx) => {
+			const parts = (args ?? "").split(/\s+/).filter(Boolean);
+			const dryRun = parts.includes("dry-run") || parts.includes("--dry-run");
+			const days = Number(parts.find((part) => /^\d+$/.test(part)) ?? 90);
+			const normalized = store.normalizeStore();
+			const forgotten = store.forget(days, !dryRun);
+			store.refreshDiscoveryFile();
+			const report = store.doctor();
+			ctx.ui.notify([
+				"Reflect maintenance complete",
+				`Normalized fields: ${normalized.updated}`,
+				`Forget candidates: ${forgotten.candidates}`,
+				`Archived: ${forgotten.archived}`,
+				forgotten.archivePath ? `Archive: ${forgotten.archivePath}` : "",
+				`Total reflections: ${report.total}`,
+				`High-value not queued: ${report.highValueNotQueued}`,
+			].filter(Boolean).join("\n"), report.highValueNotQueued ? "warning" : "info");
+		},
+	});
 
 	pi.registerCommand("reflect:automations", {
 		description: "List reflect-generated automation scripts",
@@ -1106,6 +1156,25 @@ export default function (pi: ExtensionAPI) {
 						ctx.ui.notify(`Recent reflections:\n\n${lines.join("\n")}`, "info");
 						break;
 					}
+					case "maintenance": {
+						const parts = rest.split(/\s+/).filter(Boolean);
+						const dryRun = parts.includes("dry-run") || parts.includes("--dry-run");
+						const days = Number(parts.find((part) => /^\d+$/.test(part)) ?? 90);
+						const normalized = store.normalizeStore();
+						const forgotten = store.forget(days, !dryRun);
+						store.refreshDiscoveryFile();
+						const report = store.doctor();
+						ctx.ui.notify([
+							"Reflect maintenance complete",
+							`Normalized fields: ${normalized.updated}`,
+							`Forget candidates: ${forgotten.candidates}`,
+							`Archived: ${forgotten.archived}`,
+							forgotten.archivePath ? `Archive: ${forgotten.archivePath}` : "",
+							`Total reflections: ${report.total}`,
+							`High-value not queued: ${report.highValueNotQueued}`,
+						].filter(Boolean).join("\n"), report.highValueNotQueued ? "warning" : "info");
+						break;
+					}
 					case "automations": {
 						const scripts = generatedAutomationScripts(ctx.cwd);
 						ctx.ui.notify(scripts.length ? scripts.map((s) => `- ${s.rel}`).join("\n") : "No reflect-generated automations.", "info");
@@ -1199,6 +1268,7 @@ export default function (pi: ExtensionAPI) {
 								`  /reflect stats          — Show statistics`,
 								`  /reflect doctor         — Audit storage/discovery/handoffs`,
 								`  /reflect automations    — List generated automation scripts`,
+								`  /reflect maintenance    — Normalize, forget, refresh discovery files`,
 								`  /reflect forget [apply] — Archive stale low-value reflections`,
 								`  /reflect recent [N]     — Show last N reflections`,
 								`  /reflect pending        — Show pending materializations`,

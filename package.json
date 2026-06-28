@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "bun scripts/check-extension.ts"
+    "check": "bun scripts/check-extension.ts",
+    "maintain": "bun scripts/maintain-project.ts"
   },
   "dependencies": {
     "@mariozechner/pi-coding-agent": "^0.51.5",
