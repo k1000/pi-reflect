@@ -45,6 +45,8 @@ export interface ReflectionEntry {
 	archivistOutboxId?: string;
 	accessCount?: number;
 	lastAccessedAt?: string;
+	occurrenceCount?: number;
+	lastSeenAt?: string;
 	/** Materialization fields */
 	mode?: Mode;
 	confidence?: Confidence;
@@ -185,6 +187,9 @@ export class ReflectionStore {
 		// written by default; `getContent()` renders markdown from JSONL on demand.
 		const fileName = "";
 
+		const duplicate = this.findDuplicate(input);
+		if (duplicate) return this.mergeDuplicate(duplicate, input, now);
+
 		// Append to canonical store
 		const entry: ReflectionEntry = {
 			id,
@@ -205,6 +210,8 @@ export class ReflectionStore {
 			...(input.mode && { mode: input.mode }),
 			...(input.confidence && { confidence: input.confidence }),
 			...(input.target && { target: input.target }),
+			occurrenceCount: 1,
+			lastSeenAt: now.toISOString(),
 			materialized: false,
 		};
 
@@ -218,6 +225,52 @@ export class ReflectionStore {
 		}
 
 		return entry;
+	}
+
+	private duplicateKey(input: ReflectionContent): string {
+		const command = input.evidence?.trim();
+		if (input.type === "automation" && command) return `automation:${command}`;
+		return `${input.type}:${this.slugify(input.title)}`;
+	}
+
+	private entryDuplicateKey(entry: ReflectionEntry): string {
+		const command = entry.evidence?.trim();
+		if (entry.type === "automation" && command) return `automation:${command}`;
+		return `${entry.type}:${this.slugify(entry.title)}`;
+	}
+
+	private findDuplicate(input: ReflectionContent): ReflectionEntry | undefined {
+		const key = this.duplicateKey(input);
+		return this.loadIndex().find((entry) => this.entryDuplicateKey(entry) === key);
+	}
+
+	private async mergeDuplicate(existing: ReflectionEntry, input: ReflectionContent, now: Date): Promise<ReflectionEntry> {
+		const entries = this.loadIndex();
+		const mergedTags = [...new Set([...existing.tags, ...input.tags.map((tag) => tag.toLowerCase())])];
+		const updated: ReflectionEntry = {
+			...existing,
+			summary: input.content.slice(0, 240) || existing.summary,
+			body: input.content || existing.body,
+			context: input.context ?? existing.context,
+			evidence: input.evidence ?? existing.evidence,
+			application: input.application ?? existing.application,
+			verification: input.verification ?? existing.verification,
+			importance: this.maxImportance(existing.importance, input.importance),
+			tags: mergedTags,
+			mode: input.mode ?? existing.mode,
+			confidence: input.confidence ?? existing.confidence,
+			target: input.target ?? existing.target,
+			occurrenceCount: (existing.occurrenceCount ?? 1) + 1,
+			lastSeenAt: now.toISOString(),
+		};
+		this.rewriteIndex(entries.map((entry) => entry.id === existing.id ? updated : entry));
+		if (input.mode === "execute" && updated.target && updated.target.targetType !== "none") await this.materialize(updated);
+		return updated;
+	}
+
+	private maxImportance(a: Importance, b: Importance): Importance {
+		const rank: Record<Importance, number> = { low: 0, medium: 1, high: 2, critical: 3 };
+		return rank[b] > rank[a] ? b : a;
 	}
 
 	// ─── Materialize ───────────────────────────────────────────────

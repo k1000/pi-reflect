@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -117,6 +117,23 @@ function slug(value: string): string {
 	return value.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "reflection-skill";
 }
 
+function registerPackageScript(cwd: string, scriptPath: string, title: string): string | null {
+	const packageJsonPath = path.join(cwd, "package.json");
+	if (!existsSync(packageJsonPath)) return null;
+	try {
+		const parsed = JSON.parse(readFileSync(packageJsonPath, "utf8"));
+		const scripts = parsed.scripts && typeof parsed.scripts === "object" ? parsed.scripts : {};
+		const scriptName = `reflect:${slug(title).slice(0, 40)}`;
+		const rel = path.relative(cwd, scriptPath).replace(/\\/g, "/");
+		scripts[scriptName] = `bash ${rel}`;
+		parsed.scripts = scripts;
+		writeFileSync(packageJsonPath, JSON.stringify(parsed, null, 2) + "\n", "utf8");
+		return scriptName;
+	} catch {
+		return null;
+	}
+}
+
 function automationScriptContent(candidate: ReturnType<typeof updateAutomationCandidates>[number]): string {
 	return [
 		"#!/usr/bin/env bash",
@@ -142,6 +159,8 @@ function automationScriptContent(candidate: ReturnType<typeof updateAutomationCa
 async function captureAutomationCandidates(state: ReflectLearningState, store: ReflectionStore, cwd: string, recentText: string): Promise<number> {
 	const candidates = updateAutomationCandidates(state.automation, recentText, 3, cwd);
 	for (const candidate of candidates) {
+		const scriptPath = path.join(cwd, "scripts", "reflect-automations", `${slug(candidate.title)}-${candidate.hash}.sh`);
+		const packageScript = registerPackageScript(cwd, scriptPath, candidate.title);
 		const entry = await store.save({
 			type: "automation",
 			title: candidate.title,
@@ -150,12 +169,12 @@ async function captureAutomationCandidates(state: ReflectLearningState, store: R
 			tags: ["auto-captured", "automation-candidate", candidate.safety, "auto-script"],
 			context: `Repeated command detected ${candidate.count} times in session/tool history.`,
 			evidence: candidate.command,
-			application: `Auto-created script for repeated workflow: scripts/reflect-automations/${slug(candidate.title)}-${candidate.hash}.sh`,
+			application: `Auto-created script for repeated workflow: scripts/reflect-automations/${slug(candidate.title)}-${candidate.hash}.sh${packageScript ? `; package script: ${packageScript}` : ""}`,
 			mode: "execute",
 			confidence: candidate.confidence,
 			target: {
 				targetType: "user_script",
-				targetPath: path.join(cwd, "scripts", "reflect-automations", `${slug(candidate.title)}-${candidate.hash}.sh`),
+				targetPath: scriptPath,
 				action: "update",
 				executable: true,
 				fileContent: automationScriptContent(candidate),
