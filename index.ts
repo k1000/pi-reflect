@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
@@ -365,12 +365,43 @@ export default function (pi: ExtensionAPI) {
 		return path.join(cwd, ".pi-memory", "scratchpad");
 	}
 
-	function generatedAutomationScripts(cwd: string): Array<{ name: string; path: string; rel: string }> {
+	function automationRunLogPath(cwd: string): string {
+		return path.join(cwd, ".pi", "reflect", "automation-runs.jsonl");
+	}
+
+	type AutomationRunRecord = { script: string; status: "passed" | "failed"; durationMs: number; at: string; error?: string };
+
+	function readAutomationRuns(cwd: string): AutomationRunRecord[] {
+		const file = automationRunLogPath(cwd);
+		if (!existsSync(file)) return [];
+		return readFileSync(file, "utf8").split(/\r?\n/).filter(Boolean).map((line) => {
+			try { return JSON.parse(line) as AutomationRunRecord; }
+			catch { return null; }
+		}).filter((item): item is AutomationRunRecord => Boolean(item));
+	}
+
+	function automationRunSummary(cwd: string, rel: string): string {
+		const runs = readAutomationRuns(cwd).filter((run) => run.script === rel);
+		if (!runs.length) return "runs=0";
+		const failures = runs.filter((run) => run.status === "failed").length;
+		const last = runs[runs.length - 1]!;
+		return `runs=${runs.length} failures=${failures} last=${last.status}`;
+	}
+
+	function recordAutomationRun(cwd: string, record: AutomationRunRecord): void {
+		appendFileSync(automationRunLogPath(cwd), JSON.stringify(record) + "\n", "utf8");
+	}
+
+	function generatedAutomationScripts(cwd: string): Array<{ name: string; path: string; rel: string; summary: string }> {
 		const root = path.join(cwd, "scripts", "reflect-automations");
 		if (!existsSync(root)) return [];
 		return readdirSync(root)
 			.filter((name) => name.endsWith(".sh"))
-			.map((name) => ({ name, path: path.join(root, name), rel: path.relative(cwd, path.join(root, name)).replace(/\\/g, "/") }))
+			.map((name) => {
+				const scriptPath = path.join(root, name);
+				const rel = path.relative(cwd, scriptPath).replace(/\\/g, "/");
+				return { name, path: scriptPath, rel, summary: automationRunSummary(cwd, rel) };
+			})
 			.filter((item) => statSync(item.path).isFile());
 	}
 
@@ -435,17 +466,21 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const scripts = generatedAutomationScripts(ctx.cwd);
 			if (params.name === "list") {
-				return { content: [{ type: "text" as const, text: scripts.length ? scripts.map((s) => `- ${s.rel}`).join("\n") : "No reflect-generated automations." }], details: { scripts } };
+				return { content: [{ type: "text" as const, text: scripts.length ? scripts.map((s) => `- ${s.rel} (${s.summary})`).join("\n") : "No reflect-generated automations." }], details: { scripts } };
 			}
 			const script = scripts.find((s) => s.name === params.name || s.rel === params.name);
 			if (!script) return { content: [{ type: "text" as const, text: `Reflect automation not found: ${params.name}` }], details: { scripts }, isError: true };
 			const command = `bash ${script.rel}`;
 			if (params.dryRun) return { content: [{ type: "text" as const, text: `Dry run: ${command}` }], details: { script, command } };
+			const started = Date.now();
 			try {
 				const { stdout, stderr } = await execFileAsync("bash", [script.path], { cwd: ctx.cwd, timeout: 120_000, maxBuffer: 1_000_000 });
+				recordAutomationRun(ctx.cwd, { script: script.rel, status: "passed", durationMs: Date.now() - started, at: new Date().toISOString() });
 				return { content: [{ type: "text" as const, text: [stdout.trim(), stderr.trim()].filter(Boolean).join("\n") || "Reflect automation completed with no output" }], details: { script, command } };
 			} catch (error) {
-				return { content: [{ type: "text" as const, text: `Reflect automation failed: ${error instanceof Error ? error.message : String(error)}` }], details: { script, command }, isError: true };
+				const message = error instanceof Error ? error.message : String(error);
+				recordAutomationRun(ctx.cwd, { script: script.rel, status: "failed", durationMs: Date.now() - started, at: new Date().toISOString(), error: message.slice(0, 500) });
+				return { content: [{ type: "text" as const, text: `Reflect automation failed: ${message}` }], details: { script, command }, isError: true };
 			}
 		},
 	});
@@ -495,7 +530,7 @@ export default function (pi: ExtensionAPI) {
 		description: "List reflect-generated automation scripts",
 		handler: async (_args, ctx) => {
 			const scripts = generatedAutomationScripts(ctx.cwd);
-			ctx.ui.notify(scripts.length ? scripts.map((s) => `- ${s.rel}`).join("\n") : "No reflect-generated automations.", "info");
+			ctx.ui.notify(scripts.length ? scripts.map((s) => `- ${s.rel} (${s.summary})`).join("\n") : "No reflect-generated automations.", "info");
 		},
 	});
 
